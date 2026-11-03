@@ -61,26 +61,31 @@ class Cache:
         self._loader: Callable[[str], Awaitable[str]] = loader
         self.store: dict[str, State] = {}
 
+    def _on_done(self, key: str, state: State) -> str:
+        if not state.task.cancelled() and state.task.exception() and self.store.get(key) is state:
+            del self.store[key]
+
     async def get(self, key: str) -> str:
         try:
             state: State = None
             if key not in self.store:
-                state = State(1, asyncio.create_task(self._loader(key)))
+                t = asyncio.create_task(self._loader(key))
+                state = State(1, t)
                 self.store[key] = state
+
+                # callback run first before any awaiters.
+                # this prevent new get() calls from joining a state with a task that has finished with an exception.
+                # the order of operations depends on the order of await.
+                # so if a code awaits, then later on some other code calls add_done_callback()
+                # then the awaiter runs first.
+                t.add_done_callback(lambda _t: self._on_done(key, state))
+                
             else:
                 state = self.store[key]
                 state.num_callers += 1
 
-            try:
-                res = await asyncio.shield(state.task)
-                return res
-            except LookupError as err:
-                state.num_callers -= 1
-                if state.num_callers == 0:
-                    del self.store[key]
-                raise err
+            return await asyncio.shield(state.task)
             
-
         except asyncio.CancelledError as err:
             state.num_callers -= 1
             if state.num_callers == 0:
